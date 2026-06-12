@@ -1,5 +1,4 @@
 import os
-# 🚨 BLOQUEO DE RAM: Forzamos a la IA a usar un solo hilo ANTES de cargar las librerías 🚨
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -10,13 +9,11 @@ import io
 import cv2
 import numpy as np
 import uvicorn
-import gc # Recolector de basura para limpiar la RAM
+import gc
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageOps
-
-# Importamos las IA pesadas después de bloquear los hilos
 import mediapipe as mp
 from rembg import remove, new_session
 
@@ -24,20 +21,19 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.bracketzen.com", "http://localhost:5173"], 
+    allow_origins=["https://www.bracketzen.com", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Inicialización de IA
 print("Cargando detector facial...")
 mp_face_detection = mp.solutions.face_detection
 face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.4)
 
-print("Cargando modelo ligero de recorte...")
-# Ya no hacemos el "calentamiento" con la foto falsa porque el archivo ya está descargado
-light_session = new_session("u2netp") 
-print("IA lista y esperando fotos.")
+print("Cargando modelo de alta calidad (u2net)...")
+rembg_session = new_session("u2net") 
 
 @app.post("/procesar-avatar")
 def procesar_avatar(file: UploadFile = File(...)):
@@ -45,46 +41,55 @@ def procesar_avatar(file: UploadFile = File(...)):
         contents = file.file.read()
         input_image = ImageOps.exif_transpose(Image.open(io.BytesIO(contents))).convert("RGBA")
         
-        # Quitar fondo
-        output_image = remove(input_image, session=light_session)
-        W, H = output_image.size
-        img_cv2 = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGBA2RGB)
+        # Pre-escalado: Si la imagen es muy grande, redúcela para que la IA trabaje mejor y más rápido
+        if max(input_image.size) > 1200:
+            input_image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+            
+        W, H = input_image.size
         
-        # Detección de cara
+        # Quitar fondo con modelo de alta calidad
+        output_image = remove(input_image, session=rembg_session)
+        
+        # Detección de cara para encuadre
+        img_cv2 = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGBA2RGB)
         results = face_detector.process(img_cv2)
-        face_found = False
+        
+        cx, cy, S = W // 2, H // 2, min(W, H)
         mirar_izquierda = False
-        cx, cy, f_size = W // 2, H // 2, min(W, H)
 
         if results.detections:
-            face_found = True
             detection = results.detections[0]
             bbox = detection.location_data.relative_bounding_box
             
-            fw = int(bbox.width * W)
-            fh = int(bbox.height * H)
+            # Cálculo de centro y tamaño de zoom
+            fw, fh = bbox.width * W, bbox.height * H
             f_size = max(fw, fh)
             cx = int((bbox.xmin + bbox.width / 2) * W)
             cy = int((bbox.ymin + bbox.height / 2) * H)
             
+            # Lógica de encuadre: zoom 1.6 para mostrar cabeza y hombros
+            S = int(f_size * 1.6)
+            
+            # Ajuste vertical: subimos el centro para que la cara no quede muy abajo
+            y1 = max(0, min(cy - int(S * 0.45), H - S))
+            x1 = max(0, min(cx - S // 2, W - S))
+            
+            # Detección de dirección
             keypoints = detection.location_data.relative_keypoints
-            dist_left = keypoints[2].x - keypoints[4].x
-            dist_right = keypoints[5].x - keypoints[2].x
-            if dist_left < (dist_right * 0.8):
+            if keypoints[2].x - keypoints[4].x < (keypoints[5].x - keypoints[2].x) * 0.8:
                 mirar_izquierda = True
-                
-        # Recorte Estricto
-        S = min(int(f_size * 2.5) if face_found else min(W, H), W, H)
-        x1 = max(0, min(cx - S // 2, W - S))
-        y1 = max(0, min(cy - int(S * 0.35), H - S))
+        else:
+            # Fallback si no hay cara: centrar imagen cuadrada
+            x1, y1 = (W - S) // 2, (H - S) // 2
 
+        # Recorte y aplicación de espejo
         cropped = output_image.crop((x1, y1, x1 + S, y1 + S))
         if mirar_izquierda:
             cropped = ImageOps.mirror(cropped)
 
-        # Composición circular
+        # Composición Circular (600x600)
         CANVAS_SIZE = 600
-        MARGIN = 10
+        MARGIN = 15 # Margen interno un poco mayor para estética
         cropped = cropped.resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.LANCZOS)
         
         bg = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
@@ -92,6 +97,7 @@ def procesar_avatar(file: UploadFile = File(...)):
         bg_draw.ellipse((MARGIN, MARGIN, CANVAS_SIZE - MARGIN, CANVAS_SIZE - MARGIN), fill="#9EAEE3")
         bg.paste(cropped, (0, 0), cropped)
 
+        # Máscara para bordes redondeados
         mask = Image.new("L", (CANVAS_SIZE, CANVAS_SIZE), 0)
         ImageDraw.Draw(mask).ellipse((MARGIN, MARGIN, CANVAS_SIZE - MARGIN, CANVAS_SIZE - MARGIN), fill=255)
 
@@ -101,15 +107,14 @@ def procesar_avatar(file: UploadFile = File(...)):
         img_byte_arr = io.BytesIO()
         final_output.save(img_byte_arr, format='PNG')
         
-        # 🚨 LIMPIEZA DE MEMORIA: Vaciamos la RAM para evitar que la siguiente foto explote el servidor
-        del input_image, output_image, img_cv2, results, cropped, bg, mask, final_output
+        # Limpieza
+        del input_image, output_image, cropped, bg, mask
         gc.collect()
 
         return Response(content=img_byte_arr.getvalue(), media_type="image/png")
         
     except Exception as e:
-        print(f"Error crítico en el backend: {e}")
-        return Response(status_code=500, content=f"Error interno: {str(e)}")
+        return Response(status_code=500, content=f"Error en procesar_avatar: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
