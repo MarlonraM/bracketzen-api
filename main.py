@@ -1,33 +1,29 @@
+import os
+import io
+import cv2
+import numpy as np
+import mediapipe as mp
+import uvicorn
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from rembg import remove
 from PIL import Image, ImageDraw, ImageOps
-import mediapipe as mp
-import numpy as np
-import cv2
-import io
-import os
-import uvicorn
+from rembg import remove
 
-# Inicializamos la App
 app = FastAPI()
 
-# Configuración estricta de CORS para tu dominio
+# Permitimos tanto el dominio en producción como el entorno local por si necesitas depurar
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.bracketzen.com"], 
+    allow_origins=["https://www.bracketzen.com", "http://localhost:5173"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# CARGA DE MODELOS FUERA DE LA FUNCIÓN (Se carga solo una vez al iniciar)
-print("Iniciando carga de modelos de IA...")
+# Inicializar modelos al arrancar (fuera de la función para no consumir RAM en cada petición)
 mp_face_detection = mp.solutions.face_detection
-# Pre-cargamos el modelo para que la primera foto no tarde tanto
 face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.4)
-print("IA lista para recibir fotos.")
 
 @app.post("/procesar-avatar")
 async def procesar_avatar(file: UploadFile = File(...)):
