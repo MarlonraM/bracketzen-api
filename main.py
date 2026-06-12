@@ -1,13 +1,23 @@
 import os
+# 🚨 BLOQUEO DE RAM: Forzamos a la IA a usar un solo hilo ANTES de cargar las librerías 🚨
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import io
 import cv2
 import numpy as np
-import mediapipe as mp
 import uvicorn
+import gc # Recolector de basura para limpiar la RAM
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageOps
+
+# Importamos las IA pesadas después de bloquear los hilos
+import mediapipe as mp
 from rembg import remove, new_session
 
 app = FastAPI()
@@ -20,27 +30,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. Cargar modelos
 print("Cargando detector facial...")
 mp_face_detection = mp.solutions.face_detection
 face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.4)
 
 print("Cargando modelo ligero de recorte...")
+# Ya no hacemos el "calentamiento" con la foto falsa porque el archivo ya está descargado
 light_session = new_session("u2netp") 
-
-# 2. EL TRUCO MAESTRO: Calentar el motor. 
-# Procesamos una imagen falsa de 10x10 para obligar a Render a descargar los archivos
-# de la IA ahora, y no cuando un usuario suba su primera foto.
-print("Calentando la IA...")
-dummy_img = Image.new("RGBA", (10, 10), (255, 255, 255, 255))
-_ = remove(dummy_img, session=light_session)
 print("IA lista y esperando fotos.")
 
-# 3. LA CORRECCIÓN DE FASTAPI: 'def' normal en lugar de 'async def'
 @app.post("/procesar-avatar")
 def procesar_avatar(file: UploadFile = File(...)):
     try:
-        # Usamos file.file.read() porque ya no es una función asíncrona
         contents = file.file.read()
         input_image = ImageOps.exif_transpose(Image.open(io.BytesIO(contents))).convert("RGBA")
         
@@ -99,6 +100,11 @@ def procesar_avatar(file: UploadFile = File(...)):
 
         img_byte_arr = io.BytesIO()
         final_output.save(img_byte_arr, format='PNG')
+        
+        # 🚨 LIMPIEZA DE MEMORIA: Vaciamos la RAM para evitar que la siguiente foto explote el servidor
+        del input_image, output_image, img_cv2, results, cropped, bg, mask, final_output
+        gc.collect()
+
         return Response(content=img_byte_arr.getvalue(), media_type="image/png")
         
     except Exception as e:
