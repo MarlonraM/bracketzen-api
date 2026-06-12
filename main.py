@@ -20,26 +20,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🚨 EL CAMBIO CRÍTICO: Cargar la IA Ligera 🚨
+# 1. Cargar modelos
+print("Cargando detector facial...")
 mp_face_detection = mp.solutions.face_detection
 face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.4)
 
-# Usamos 'u2netp' (Piccolo) en lugar del modelo pesado por defecto para evitar el 502
+print("Cargando modelo ligero de recorte...")
 light_session = new_session("u2netp") 
 
+# 2. EL TRUCO MAESTRO: Calentar el motor. 
+# Procesamos una imagen falsa de 10x10 para obligar a Render a descargar los archivos
+# de la IA ahora, y no cuando un usuario suba su primera foto.
+print("Calentando la IA...")
+dummy_img = Image.new("RGBA", (10, 10), (255, 255, 255, 255))
+_ = remove(dummy_img, session=light_session)
+print("IA lista y esperando fotos.")
+
+# 3. LA CORRECCIÓN DE FASTAPI: 'def' normal en lugar de 'async def'
 @app.post("/procesar-avatar")
-async def procesar_avatar(file: UploadFile = File(...)):
+def procesar_avatar(file: UploadFile = File(...)):
     try:
-        contents = await file.read()
+        # Usamos file.file.read() porque ya no es una función asíncrona
+        contents = file.file.read()
         input_image = ImageOps.exif_transpose(Image.open(io.BytesIO(contents))).convert("RGBA")
         
-        # 1. Quitar fondo pasándole la sesión ligera
+        # Quitar fondo
         output_image = remove(input_image, session=light_session)
-        
         W, H = output_image.size
         img_cv2 = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGBA2RGB)
         
-        # 2. Detección de cara
+        # Detección de cara
         results = face_detector.process(img_cv2)
         face_found = False
         mirar_izquierda = False
@@ -62,7 +72,7 @@ async def procesar_avatar(file: UploadFile = File(...)):
             if dist_left < (dist_right * 0.8):
                 mirar_izquierda = True
                 
-        # 3. Recorte Estricto
+        # Recorte Estricto
         S = min(int(f_size * 2.5) if face_found else min(W, H), W, H)
         x1 = max(0, min(cx - S // 2, W - S))
         y1 = max(0, min(cy - int(S * 0.35), H - S))
@@ -71,7 +81,7 @@ async def procesar_avatar(file: UploadFile = File(...)):
         if mirar_izquierda:
             cropped = ImageOps.mirror(cropped)
 
-        # 4. Composición
+        # Composición circular
         CANVAS_SIZE = 600
         MARGIN = 10
         cropped = cropped.resize((CANVAS_SIZE, CANVAS_SIZE), Image.Resampling.LANCZOS)
@@ -92,8 +102,8 @@ async def procesar_avatar(file: UploadFile = File(...)):
         return Response(content=img_byte_arr.getvalue(), media_type="image/png")
         
     except Exception as e:
-        print(f"Error procesando la imagen: {e}")
-        return Response(status_code=500, content="Error interno procesando el avatar")
+        print(f"Error crítico en el backend: {e}")
+        return Response(status_code=500, content=f"Error interno: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
